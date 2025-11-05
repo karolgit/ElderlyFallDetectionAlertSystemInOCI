@@ -7,10 +7,17 @@ import signal
 from typing import Dict, List, Optional
 
 import cv2
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
+import json
+import time
+
+try:
+    import oci  # type: ignore
+except Exception:
+    oci = None  # type: ignore
 
 from .device import get_torch_device, summarize_device
 from .pose import PoseEstimator
@@ -104,6 +111,68 @@ def get_estimator(preferred: str | None) -> PoseEstimator:
         logger.debug("Creating PoseEstimator for device_type=%s", device_type)
         _estimators[device_type] = PoseEstimator(preferred_device=device_type)
     return _estimators[device_type]
+OCI_REGION = os.getenv("OCI_REGION", "us-chicago-1")
+INPUT_BUCKET = os.getenv("INPUT_BUCKET", "guidanceaiwatch_input")
+OUTPUT_BUCKET = os.getenv("OUTPUT_BUCKET", "guidanceaiwatch_output")
+PROCESSED_BUCKET = os.getenv("PROCESSED_BUCKET", "guidanceaiwatch_processed")
+
+_os_client = None
+_os_namespace = None
+
+
+def _ensure_object_storage() -> None:
+    global _os_client, _os_namespace
+    if _os_client and _os_namespace:
+        return
+    if oci is None:
+        logger.warning("OCI SDK not installed; skipping Object Storage setup.")
+        return
+    try:
+        # Prefer Instance Principals on OCI compute
+        signer = None
+        try:
+            signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()  # type: ignore[attr-defined]
+        except Exception:
+            signer = None
+        if signer is not None:
+            _os_client = oci.object_storage.ObjectStorageClient({}, signer=signer)  # type: ignore[attr-defined]
+            try:
+                _os_client.base_client.set_region(OCI_REGION)
+            except Exception:
+                pass
+        else:
+            cfg = oci.config.from_file()  # type: ignore[attr-defined]
+            if "region" not in cfg:
+                cfg["region"] = OCI_REGION
+            _os_client = oci.object_storage.ObjectStorageClient(cfg)  # type: ignore[attr-defined]
+        ns = _os_client.get_namespace().data
+        _os_namespace = ns
+        logger.debug("OCI Object Storage initialized. namespace=%s region=%s", _os_namespace, OCI_REGION)
+    except Exception as e:
+        logger.warning("Failed to initialize OCI Object Storage: %s", e)
+        _os_client = None
+        _os_namespace = None
+
+
+def _upload_bytes(bucket: str, object_name: str, data: bytes, content_type: str | None = None) -> None:
+    _ensure_object_storage()
+    if not _os_client or not _os_namespace:
+        logger.warning("Object Storage not available; skipping upload bucket=%s object=%s", bucket, object_name)
+        return
+    try:
+        _os_client.put_object(
+            _os_namespace, bucket, object_name, data, content_type=content_type
+        )
+        logger.debug("Uploaded to bucket=%s object=%s size=%d", bucket, object_name, len(data))
+    except Exception as e:
+        logger.warning("Upload failed bucket=%s object=%s err=%s", bucket, object_name, e)
+
+
+def _ts_name(prefix: str, fname: str, suffix: str) -> str:
+    ts = time.strftime("%Y-%m-%dT%H-%M-%S")
+    base = (fname or "video").replace("/", "_").replace("\\", "_")
+    return f"{ts}_{prefix}_{base}{suffix}"
+
 
 
 @app.get("/health")
@@ -144,6 +213,7 @@ async def analyze_frame(req: FrameAnalyzeRequest) -> FrameAnalyzeResponse:
 @app.post("/analyze_video", response_model=VideoAnalyzeResponse)
 async def analyze_video(
     file: UploadFile = File(...),
+    save_to_bucket: bool = Form(False),
 ) -> VideoAnalyzeResponse:
     logger.debug("/analyze_video called. filename=%s content_type=%s", file.filename, file.content_type)
     if _STOP_EVENT.is_set():
@@ -199,18 +269,27 @@ async def analyze_video(
 
     avg_score = float(sum(scores) / len(scores)) if scores else 0.0
     logger.debug("Video analyzed frames=%d any_fall=%s avg_score=%.3f", analyzed, len(fall_frames) > 0, avg_score)
-    return VideoAnalyzeResponse(
+    resp = VideoAnalyzeResponse(
         device=device_info,
         analyzed_frames=analyzed,
         any_fall=len(fall_frames) > 0,
         fall_frames=fall_frames,
         average_fall_score=avg_score,
     )
+    try:
+        if save_to_bucket:
+            meta = json.dumps(resp.model_dump())
+            obj = _ts_name("analysis", file.filename or "video.mp4", ".json")
+            _upload_bytes(PROCESSED_BUCKET, obj, meta.encode("utf-8"), content_type="application/json")
+    except Exception:
+        pass
+    return resp
 
 
 @app.post("/annotate_video")
 async def annotate_video(
     file: UploadFile = File(...),
+    save_to_bucket: bool = Form(False),
 ) -> FileResponse:
     logger.debug("/annotate_video called. filename=%s content_type=%s", file.filename, file.content_type)
     if _STOP_EVENT.is_set():
@@ -270,6 +349,17 @@ async def annotate_video(
 
         filename = (file.filename or 'annotated').rsplit('.', 1)[0] + '_annotated.mp4'
         logger.debug("Annotated video written to %s frames=%d", out_path, processed)
+        if save_to_bucket:
+            try:
+                with open(out_path, 'rb') as f:
+                    data = f.read()
+                obj = _ts_name("annotated", file.filename or "video.mp4", ".mp4")
+                _upload_bytes(OUTPUT_BUCKET, obj, data, content_type='video/mp4')
+                meta = json.dumps({"processed_frames": processed, "source": file.filename})
+                meta_obj = _ts_name("annotate_meta", file.filename or "video.mp4", ".json")
+                _upload_bytes(PROCESSED_BUCKET, meta_obj, meta.encode('utf-8'), content_type='application/json')
+            except Exception:
+                pass
         return FileResponse(out_path, media_type='video/mp4', filename=filename)
     except HTTPException:
         raise
@@ -286,7 +376,7 @@ _JOBS: Dict[str, Dict[str, object]] = {}
 _JOBS_LOCK = Lock()
 
 
-def _start_job_state(filename: str, total_frames: Optional[int]) -> str:
+def _start_job_state(filename: str, total_frames: Optional[int], save_to_bucket: bool) -> str:
     job_id = uuid.uuid4().hex
     with _JOBS_LOCK:
         _JOBS[job_id] = {
@@ -296,6 +386,7 @@ def _start_job_state(filename: str, total_frames: Optional[int]) -> str:
             "error": None,
             "out_path": None,
             "filename": filename,
+            "save_to_bucket": bool(save_to_bucket),
         }
     return job_id
 
@@ -325,7 +416,7 @@ def _error_job(job_id: str, message: str) -> None:
             job["error"] = message
 
 
-def _annotate_worker(job_id: str, content: bytes, orig_filename: str, preferred_device: Optional[str]) -> None:
+def _annotate_worker(job_id: str, content: bytes, orig_filename: str, preferred_device: Optional[str], save_to_bucket: bool) -> None:
     try:
         estimator = get_estimator(preferred_device)
         in_tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
@@ -376,6 +467,17 @@ def _annotate_worker(job_id: str, content: bytes, orig_filename: str, preferred_
                 pass
             return
         _update_job(job_id, processed=processed)
+        if save_to_bucket:
+            try:
+                with open(out_path, 'rb') as f:
+                    data = f.read()
+                obj = _ts_name("annotated", orig_filename or "video.mp4", ".mp4")
+                _upload_bytes(OUTPUT_BUCKET, obj, data, content_type='video/mp4')
+                meta = json.dumps({"processed_frames": processed, "source": orig_filename})
+                meta_obj = _ts_name("annotate_meta", orig_filename or "video.mp4", ".json")
+                _upload_bytes(PROCESSED_BUCKET, meta_obj, meta.encode('utf-8'), content_type='application/json')
+            except Exception:
+                pass
         _finish_job(job_id, out_path)
     except Exception as e:
         logger.exception("Annotate worker error: %s", e)
@@ -385,7 +487,7 @@ def _annotate_worker(job_id: str, content: bytes, orig_filename: str, preferred_
 
 
 @app.post("/annotate_video_async")
-async def annotate_video_async(file: UploadFile = File(...)) -> dict:
+async def annotate_video_async(file: UploadFile = File(...), save_to_bucket: bool = Form(False)) -> dict:
     logger.debug("/annotate_video_async called. filename=%s", file.filename)
     if _STOP_EVENT.is_set():
         raise HTTPException(status_code=503, detail="Server stopping")
@@ -406,8 +508,8 @@ async def annotate_video_async(file: UploadFile = File(...)) -> dict:
     except Exception:
         total = None
 
-    job_id = _start_job_state(file.filename or "video.mp4", total)
-    t = Thread(target=_annotate_worker, args=(job_id, content, file.filename or "video.mp4", preferred_device), daemon=False)
+    job_id = _start_job_state(file.filename or "video.mp4", total, save_to_bucket)
+    t = Thread(target=_annotate_worker, args=(job_id, content, file.filename or "video.mp4", preferred_device, save_to_bucket), daemon=False)
     _register_worker(t)
     t.start()
     return {"job_id": job_id}

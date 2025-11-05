@@ -14,6 +14,8 @@
     "form-data": "^4.0.0",
     "morgan": "^1.10.0",
     "multer": "^1.4.5-lts.1",
+    "oci-common": "^2.79.0",
+    "oci-objectstorage": "^2.79.0",
     "serve-static": "^1.15.0"
   }
 }

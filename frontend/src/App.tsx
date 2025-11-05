@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import axios from 'axios'
 
-const API_BASE = '/api'
+const API_BASE = ((import.meta as any).env?.BASE_URL ?? '/') + 'api'
 
 type Keypoint = { x: number; y: number; score: number; name?: string }
 interface PersonPose { keypoints: Keypoint[]; score: number; bbox?: number[] }
@@ -96,6 +96,7 @@ export default function App() {
   const [banner, setBanner] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null)
   const [device, setDevice] = useState<string>('')
   const [annotateProgress, setAnnotateProgress] = useState<{ jobId: string | null; percent: number | null; processed: number; total: number | null}>({ jobId: null, percent: null, processed: 0, total: null })
+  const [saveToBucket, setSaveToBucket] = useState<boolean>(false)
   const liveTimer = useRef<number | null>(null)
   const pollTimer = useRef<number | null>(null)
   const liveInflight = useRef<boolean>(false)
@@ -222,6 +223,7 @@ export default function App() {
     if (!file) return
     const form = new FormData()
     form.append('file', file)
+    form.append('save_to_bucket', saveToBucket ? 'true' : 'false')
     setAnalyzing(true)
     setBanner({ type: 'info', message: `Uploading and analyzing video: ${file.name}` })
     setLastResult(null)
@@ -254,6 +256,7 @@ export default function App() {
     if (!file) return
     const form = new FormData()
     form.append('file', file)
+    form.append('save_to_bucket', saveToBucket ? 'true' : 'false')
     setAnalyzing(true)
     setBanner({ type: 'info', message: `Annotating video (skeleton overlay): ${file.name}` })
     setAnnotateProgress({ jobId: null, percent: 0, processed: 0, total: null })
@@ -341,6 +344,12 @@ export default function App() {
         </div>
         <div>
           <div style={{ marginBottom: 8 }}>Analyze uploaded video:</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              <input type="checkbox" checked={saveToBucket} onChange={(e) => setSaveToBucket(e.target.checked)} disabled={analyzing} />
+              Save to OCI bucket
+            </label>
+          </div>
           <input type="file" accept="video/*" onChange={handleVideoUpload} disabled={analyzing} />
           <div style={{ marginTop: 12 }}>Annotate uploaded video (download):</div>
           <input type="file" accept="video/*" onChange={handleAnnotateVideo} disabled={analyzing} />

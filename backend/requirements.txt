@@ -6,3 +6,4 @@ pillow>=10.3.0
 opencv-python>=4.10.0.84
 numpy>=1.26.4
 pydantic>=2.7.0
+oci>=2.119.0
